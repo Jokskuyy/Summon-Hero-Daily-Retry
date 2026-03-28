@@ -62,6 +62,7 @@ python bot_retry_continue.py --roi-config my_roi.json --debug
 - Simpan game dalam foreground saat bot berjalan.
 - Jika klik meleset, naikkan threshold atau ambil ulang screenshot template.
 - Tombol stop bot: `Ctrl + C` di terminal.
+- Hotkey global default saat bot running: pause/resume `F8`, stop `F9`.
 
 ## 4) File template yang dipakai
 
@@ -90,3 +91,15 @@ Alternatif cepat: jalankan mode `--suggest-roi` saat screen hasil stage terlihat
 - `--roi-config`: path file ROI config (default `roi_config.json`)
 - `--no-load-roi-config`: matikan auto-load ROI dari file
 - `--no-save-roi-config`: matikan auto-save hasil suggest ROI
+
+## 7) Opsi hotkey runtime
+
+- `--no-hotkeys`: matikan hotkey global
+- `--pause-hotkey`: ganti hotkey pause/resume (format pynput, default `<f8>`)
+- `--stop-hotkey`: ganti hotkey stop (format pynput, default `<f9>`)
+
+Contoh:
+
+```powershell
+python bot_retry_continue.py --pause-hotkey "<f6>" --stop-hotkey "<f7>" --debug
+```

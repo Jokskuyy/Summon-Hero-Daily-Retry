@@ -11,6 +11,11 @@ import mss
 import numpy as np
 
 try:
+    from pynput import keyboard as pynput_keyboard
+except Exception:
+    pynput_keyboard = None
+
+try:
     import pydirectinput as clicker
 
     clicker.PAUSE = 0.03
@@ -36,8 +41,62 @@ class BotConfig:
     loading_wait: float = 8.0
     decision_roi: Optional[ROI] = None
     ready_roi: Optional[ROI] = None
+    enable_hotkeys: bool = True
+    pause_hotkey: str = "<f8>"
+    stop_hotkey: str = "<f9>"
     debug: bool = False
     dry_run: bool = False
+
+
+class RuntimeControl:
+    def __init__(self, enable_hotkeys: bool, pause_hotkey: str, stop_hotkey: str):
+        self.enable_hotkeys = enable_hotkeys
+        self.pause_hotkey = pause_hotkey
+        self.stop_hotkey = stop_hotkey
+        self.paused = False
+        self.stop_requested = False
+        self.listener = None
+
+    def start(self) -> None:
+        if not self.enable_hotkeys:
+            print("[INFO] Hotkeys disabled")
+            return
+
+        if pynput_keyboard is None:
+            print("[WARN] pynput is not available. Hotkeys are disabled.")
+            return
+
+        try:
+            self.listener = pynput_keyboard.GlobalHotKeys(
+                {
+                    self.pause_hotkey: self.toggle_pause,
+                    self.stop_hotkey: self.request_stop,
+                }
+            )
+            self.listener.start()
+            print(
+                f"[INFO] Hotkeys active: pause/resume={self.pause_hotkey}, stop={self.stop_hotkey}"
+            )
+        except Exception as exc:
+            print(f"[WARN] Failed to start hotkeys: {exc}")
+
+    def close(self) -> None:
+        if self.listener is not None:
+            try:
+                self.listener.stop()
+            except Exception:
+                pass
+
+    def toggle_pause(self) -> None:
+        self.paused = not self.paused
+        if self.paused:
+            print("[INFO] Bot paused")
+        else:
+            print("[INFO] Bot resumed")
+
+    def request_stop(self) -> None:
+        self.stop_requested = True
+        print("[INFO] Stop requested by hotkey")
 
 
 class AdventureBot:
@@ -230,87 +289,109 @@ class AdventureBot:
         print(f"Decision ROI: {self.config.decision_roi}")
         print(f"Ready ROI: {self.config.ready_roi}")
         print(f"Dry run: {self.config.dry_run}")
+        print(
+            f"Hotkeys: {'on' if self.config.enable_hotkeys else 'off'}"
+            f" (pause={self.config.pause_hotkey}, stop={self.config.stop_hotkey})"
+        )
         print("Stop with Ctrl+C")
+
+        runtime = RuntimeControl(
+            enable_hotkeys=self.config.enable_hotkeys,
+            pause_hotkey=self.config.pause_hotkey,
+            stop_hotkey=self.config.stop_hotkey,
+        )
+        runtime.start()
 
         phase = "DECIDE"
         next_scan_at = time.time()
 
-        while True:
-            now = time.time()
-            if now < next_scan_at:
-                time.sleep(0.02)
-                continue
+        try:
+            while True:
+                if runtime.stop_requested:
+                    print("[INFO] Bot stopped by hotkey")
+                    break
 
-            screen = self._capture_screen()
-            matches = self._detect_state(screen)
-
-            rewards_score = self._score(matches["rewards_positive"])
-            rewards_zero_score = self._score(matches["rewards_zero"])
-            retry_score = self._score(matches["retry"])
-            continue_score = self._score(matches["continue"])
-            ready_score = self._score(matches["ready"])
-
-            if phase == "DECIDE":
-                rewards_left_positive = rewards_score >= self.config.threshold_rewards
-                rewards_zero = rewards_zero_score >= self.config.threshold_rewards
-                retry_visible = retry_score >= self.config.threshold_button
-                continue_visible = continue_score >= self.config.threshold_button
-
-                if rewards_zero and continue_visible:
-                    _, pos, size = matches["continue"]  # type: ignore[misc]
-                    cx, cy = self._center(pos, size)
-                    self._click(cx, cy, "Continue / Next Stage (0 reward)")
-                    phase = "WAIT_READY"
-                    next_scan_at = time.time() + self.config.loading_wait
+                if runtime.paused:
+                    time.sleep(0.08)
                     continue
 
-                if rewards_left_positive and retry_visible:
-                    _, pos, size = matches["retry"]  # type: ignore[misc]
-                    cx, cy = self._center(pos, size)
-                    self._click(cx, cy, "Retry Stage")
-                    phase = "WAIT_READY"
-                    next_scan_at = time.time() + self.config.loading_wait
+                now = time.time()
+                if now < next_scan_at:
+                    time.sleep(0.02)
                     continue
 
-                if (not rewards_left_positive) and continue_visible:
-                    _, pos, size = matches["continue"]  # type: ignore[misc]
-                    cx, cy = self._center(pos, size)
-                    self._click(cx, cy, "Continue / Next Stage")
-                    phase = "WAIT_READY"
-                    next_scan_at = time.time() + self.config.loading_wait
+                screen = self._capture_screen()
+                matches = self._detect_state(screen)
+
+                rewards_score = self._score(matches["rewards_positive"])
+                rewards_zero_score = self._score(matches["rewards_zero"])
+                retry_score = self._score(matches["retry"])
+                continue_score = self._score(matches["continue"])
+                ready_score = self._score(matches["ready"])
+
+                if phase == "DECIDE":
+                    rewards_left_positive = rewards_score >= self.config.threshold_rewards
+                    rewards_zero = rewards_zero_score >= self.config.threshold_rewards
+                    retry_visible = retry_score >= self.config.threshold_button
+                    continue_visible = continue_score >= self.config.threshold_button
+
+                    if rewards_zero and continue_visible:
+                        _, pos, size = matches["continue"]  # type: ignore[misc]
+                        cx, cy = self._center(pos, size)
+                        self._click(cx, cy, "Continue / Next Stage (0 reward)")
+                        phase = "WAIT_READY"
+                        next_scan_at = time.time() + self.config.loading_wait
+                        continue
+
+                    if rewards_left_positive and retry_visible:
+                        _, pos, size = matches["retry"]  # type: ignore[misc]
+                        cx, cy = self._center(pos, size)
+                        self._click(cx, cy, "Retry Stage")
+                        phase = "WAIT_READY"
+                        next_scan_at = time.time() + self.config.loading_wait
+                        continue
+
+                    if (not rewards_left_positive) and continue_visible:
+                        _, pos, size = matches["continue"]  # type: ignore[misc]
+                        cx, cy = self._center(pos, size)
+                        self._click(cx, cy, "Continue / Next Stage")
+                        phase = "WAIT_READY"
+                        next_scan_at = time.time() + self.config.loading_wait
+                        continue
+
+                    # Fallback rules when rewards text is not detected clearly.
+                    if continue_visible and not retry_visible:
+                        _, pos, size = matches["continue"]  # type: ignore[misc]
+                        cx, cy = self._center(pos, size)
+                        self._click(cx, cy, "Continue fallback")
+                        phase = "WAIT_READY"
+                        next_scan_at = time.time() + self.config.loading_wait
+                        continue
+
+                    if retry_visible and not continue_visible:
+                        _, pos, size = matches["retry"]  # type: ignore[misc]
+                        cx, cy = self._center(pos, size)
+                        self._click(cx, cy, "Retry fallback")
+                        phase = "WAIT_READY"
+                        next_scan_at = time.time() + self.config.loading_wait
+                        continue
+
+                    next_scan_at = time.time() + self.config.scan_interval
                     continue
 
-                # Fallback rules when rewards text is not detected clearly.
-                if continue_visible and not retry_visible:
-                    _, pos, size = matches["continue"]  # type: ignore[misc]
-                    cx, cy = self._center(pos, size)
-                    self._click(cx, cy, "Continue fallback")
-                    phase = "WAIT_READY"
-                    next_scan_at = time.time() + self.config.loading_wait
+                if phase == "WAIT_READY":
+                    if ready_score >= self.config.threshold_button:
+                        _, pos, size = matches["ready"]  # type: ignore[misc]
+                        cx, cy = self._center(pos, size)
+                        self._click(cx, cy, "Ready")
+                        phase = "DECIDE"
+                        next_scan_at = time.time() + self.config.post_click_sleep
+                        continue
+
+                    next_scan_at = time.time() + self.config.scan_interval
                     continue
-
-                if retry_visible and not continue_visible:
-                    _, pos, size = matches["retry"]  # type: ignore[misc]
-                    cx, cy = self._center(pos, size)
-                    self._click(cx, cy, "Retry fallback")
-                    phase = "WAIT_READY"
-                    next_scan_at = time.time() + self.config.loading_wait
-                    continue
-
-                next_scan_at = time.time() + self.config.scan_interval
-                continue
-
-            if phase == "WAIT_READY":
-                if ready_score >= self.config.threshold_button:
-                    _, pos, size = matches["ready"]  # type: ignore[misc]
-                    cx, cy = self._center(pos, size)
-                    self._click(cx, cy, "Ready")
-                    phase = "DECIDE"
-                    next_scan_at = time.time() + self.config.post_click_sleep
-                    continue
-
-                next_scan_at = time.time() + self.config.scan_interval
-                continue
+        finally:
+            runtime.close()
 
     def suggest_rois(
         self, samples: int = 12, sample_interval: float = 0.15
@@ -488,6 +569,23 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable auto-saving ROI after --suggest-roi",
     )
+    parser.add_argument(
+        "--no-hotkeys",
+        action="store_true",
+        help="Disable global pause/stop hotkeys",
+    )
+    parser.add_argument(
+        "--pause-hotkey",
+        type=str,
+        default="<f8>",
+        help="Global hotkey to toggle pause/resume (default: <f8>)",
+    )
+    parser.add_argument(
+        "--stop-hotkey",
+        type=str,
+        default="<f9>",
+        help="Global hotkey to stop the bot (default: <f9>)",
+    )
     parser.add_argument("--debug", action="store_true", help="Print detection scores")
     parser.add_argument("--dry-run", action="store_true", help="Do not click, only print actions")
     return parser.parse_args()
@@ -519,6 +617,9 @@ def main() -> None:
         loading_wait=args.loading_wait,
         decision_roi=decision_roi,
         ready_roi=ready_roi,
+        enable_hotkeys=not args.no_hotkeys,
+        pause_hotkey=args.pause_hotkey,
+        stop_hotkey=args.stop_hotkey,
         debug=args.debug,
         dry_run=args.dry_run,
     )
