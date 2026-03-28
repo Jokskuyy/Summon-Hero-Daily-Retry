@@ -35,10 +35,25 @@ Auto suggest ROI dari layar saat ini:
 python bot_retry_continue.py --suggest-roi --debug
 ```
 
+Hasil ROI otomatis disimpan ke file `roi_config.json`.
+
 Jika ingin sampling lebih lama:
 
 ```powershell
 python bot_retry_continue.py --suggest-roi --suggest-samples 20 --suggest-interval 0.2 --debug
+```
+
+Jalankan bot normal setelah itu (ROI otomatis di-load dari `roi_config.json`):
+
+```powershell
+python bot_retry_continue.py --debug
+```
+
+Jika mau pakai path config lain:
+
+```powershell
+python bot_retry_continue.py --suggest-roi --roi-config my_roi.json --debug
+python bot_retry_continue.py --roi-config my_roi.json --debug
 ```
 
 ## 3) Catatan penting
@@ -69,3 +84,9 @@ Jika nanti mau lebih akurat untuk kondisi 0 reward, tambahkan screenshot teks/la
 - Tentukan kotak `x,y,w,h` yang mencakup area tombol ready untuk `--ready-roi`.
 
 Alternatif cepat: jalankan mode `--suggest-roi` saat screen hasil stage terlihat, lalu pakai ROI yang dicetak bot.
+
+## 6) Opsi ROI config
+
+- `--roi-config`: path file ROI config (default `roi_config.json`)
+- `--no-load-roi-config`: matikan auto-load ROI dari file
+- `--no-save-roi-config`: matikan auto-save hasil suggest ROI
