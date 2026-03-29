@@ -35,15 +35,21 @@ ROI = Tuple[int, int, int, int]
 @dataclass
 class BotConfig:
     threshold_button: float = 0.82
+    threshold_continue: float = 0.60
+    threshold_ready: float = 0.58
     threshold_rewards: float = 0.84
     scan_interval: float = 0.35
     post_click_sleep: float = 1.6
     loading_wait: float = 8.0
+    click_hold_seconds: float = 0.06
+    click_retries: int = 3
+    verify_after_click_seconds: float = 0.35
     decision_roi: Optional[ROI] = None
     ready_roi: Optional[ROI] = None
     enable_hotkeys: bool = True
     pause_hotkey: str = "<f8>"
     stop_hotkey: str = "<f9>"
+    template_scales: Tuple[float, ...] = (0.78, 0.88, 1.0, 1.12, 1.25)
     debug: bool = False
     dry_run: bool = False
 
@@ -105,7 +111,7 @@ class AdventureBot:
         self.config = config
         self.templates: Dict[str, List[np.ndarray]] = {
             "retry": self._load_templates("*Retry*"),
-            "continue": self._load_templates("*Continue*"),
+            "continue": self._load_templates_any(["*Continue*", "*Next Stage*"]),
             "ready": self._load_templates("*Ready*"),
             "rewards_positive": self._load_templates("*rewards left*"),
             "rewards_zero": self._load_templates_any(
@@ -168,6 +174,26 @@ class AdventureBot:
 
         return screen[top:bottom, left:right], (left, top)
 
+    @staticmethod
+    def _default_decision_roi(screen: np.ndarray) -> ROI:
+        h, w = screen.shape[:2]
+        # Focus near bottom-center where result panel buttons and rewards text are expected.
+        x = int(w * 0.18)
+        y = int(h * 0.52)
+        rw = int(w * 0.64)
+        rh = int(h * 0.44)
+        return (x, y, rw, rh)
+
+    @staticmethod
+    def _default_ready_roi(screen: np.ndarray) -> ROI:
+        h, w = screen.shape[:2]
+        # Ready button usually appears in lower section of the screen.
+        x = int(w * 0.12)
+        y = int(h * 0.52)
+        rw = int(w * 0.76)
+        rh = int(h * 0.44)
+        return (x, y, rw, rh)
+
     def _find_best(
         self, screen: np.ndarray, templates: List[np.ndarray], roi: Optional[ROI] = None
     ) -> Optional[MatchResult]:
@@ -175,22 +201,32 @@ class AdventureBot:
             return None
 
         search_img, (off_x, off_y) = self._crop_by_roi(screen, roi)
+        search_gray = cv2.cvtColor(search_img, cv2.COLOR_BGR2GRAY)
         best_score = -1.0
         best_pos = (0, 0)
         best_size = (0, 0)
 
         for template in templates:
-            t_h, t_w = template.shape[:2]
-            s_h, s_w = search_img.shape[:2]
-            if t_h > s_h or t_w > s_w:
-                continue
+            for scale in self.config.template_scales:
+                if scale == 1.0:
+                    tpl = template
+                else:
+                    new_w = max(1, int(template.shape[1] * scale))
+                    new_h = max(1, int(template.shape[0] * scale))
+                    tpl = cv2.resize(template, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
 
-            result = cv2.matchTemplate(search_img, template, cv2.TM_CCOEFF_NORMED)
-            _min_val, max_val, _min_loc, max_loc = cv2.minMaxLoc(result)
-            if max_val > best_score:
-                best_score = float(max_val)
-                best_pos = (int(max_loc[0] + off_x), int(max_loc[1] + off_y))
-                best_size = (int(template.shape[1]), int(template.shape[0]))
+                t_h, t_w = tpl.shape[:2]
+                s_h, s_w = search_gray.shape[:2]
+                if t_h > s_h or t_w > s_w:
+                    continue
+
+                tpl_gray = cv2.cvtColor(tpl, cv2.COLOR_BGR2GRAY)
+                result = cv2.matchTemplate(search_gray, tpl_gray, cv2.TM_CCOEFF_NORMED)
+                _min_val, max_val, _min_loc, max_loc = cv2.minMaxLoc(result)
+                if max_val > best_score:
+                    best_score = float(max_val)
+                    best_pos = (int(max_loc[0] + off_x), int(max_loc[1] + off_y))
+                    best_size = (int(tpl.shape[1]), int(tpl.shape[0]))
 
         if best_score < 0:
             return None
@@ -207,8 +243,46 @@ class AdventureBot:
             return
 
         clicker.moveTo(x, y)
-        clicker.click(x, y)
+        try:
+            # Press and release explicitly; Roblox sometimes ignores fast click().
+            clicker.mouseDown(x=x, y=y)
+            time.sleep(self.config.click_hold_seconds)
+            clicker.mouseUp(x=x, y=y)
+        except Exception:
+            # Fallback for libraries/platforms that may not expose mouseDown/mouseUp equally.
+            clicker.click(x, y)
         print(f"[ACTION] Click {reason} at ({x}, {y}) using {CLICKER_NAME}")
+
+    def _score_in_roi(self, screen: np.ndarray, template_key: str, roi: Optional[ROI]) -> float:
+        match = self._find_best(screen, self.templates[template_key], roi)
+        return self._score(match)
+
+    def _click_with_verification(
+        self,
+        x: int,
+        y: int,
+        reason: str,
+        verify_template_key: str,
+        verify_threshold: float,
+        verify_roi: Optional[ROI],
+    ) -> bool:
+        for attempt in range(1, max(1, self.config.click_retries) + 1):
+            self._click(x, y, f"{reason} (attempt {attempt})")
+            if self.config.dry_run:
+                return True
+
+            time.sleep(self.config.verify_after_click_seconds)
+            post_screen = self._capture_screen()
+            post_score = self._score_in_roi(post_screen, verify_template_key, verify_roi)
+            if post_score < verify_threshold:
+                return True
+
+            print(
+                f"[WARN] {reason} not confirmed (score still {post_score:.3f} >= {verify_threshold:.3f})."
+            )
+
+        print(f"[WARN] {reason} failed after {self.config.click_retries} attempts.")
+        return False
 
     @staticmethod
     def _match_box(match: MatchResult) -> ROI:
@@ -251,17 +325,20 @@ class AdventureBot:
         )
 
     def _detect_state(self, screen: np.ndarray) -> Dict[str, Optional[MatchResult]]:
+        decision_roi = self.config.decision_roi or self._default_decision_roi(screen)
+        ready_roi = self.config.ready_roi or self._default_ready_roi(screen)
+
         rewards_match = self._find_best(
-            screen, self.templates["rewards_positive"], self.config.decision_roi
+            screen, self.templates["rewards_positive"], decision_roi
         )
         rewards_zero_match = self._find_best(
-            screen, self.templates["rewards_zero"], self.config.decision_roi
+            screen, self.templates["rewards_zero"], decision_roi
         )
-        retry_match = self._find_best(screen, self.templates["retry"], self.config.decision_roi)
+        retry_match = self._find_best(screen, self.templates["retry"], decision_roi)
         continue_match = self._find_best(
-            screen, self.templates["continue"], self.config.decision_roi
+            screen, self.templates["continue"], decision_roi
         )
-        ready_match = self._find_best(screen, self.templates["ready"], self.config.ready_roi)
+        ready_match = self._find_best(screen, self.templates["ready"], ready_roi)
 
         self._log_match("rewards_positive", rewards_match)
         self._log_match("rewards_zero", rewards_zero_match)
@@ -285,7 +362,10 @@ class AdventureBot:
         print("=== Roblox Adventure Retry/Continue Bot ===")
         print(f"Templates folder: {self.images_dir}")
         print(f"Threshold button: {self.config.threshold_button}")
+        print(f"Threshold continue: {self.config.threshold_continue}")
+        print(f"Threshold ready: {self.config.threshold_ready}")
         print(f"Threshold rewards: {self.config.threshold_rewards}")
+        print(f"Click retries: {self.config.click_retries}")
         print(f"Decision ROI: {self.config.decision_roi}")
         print(f"Ready ROI: {self.config.ready_roi}")
         print(f"Dry run: {self.config.dry_run}")
@@ -333,54 +413,105 @@ class AdventureBot:
                     rewards_left_positive = rewards_score >= self.config.threshold_rewards
                     rewards_zero = rewards_zero_score >= self.config.threshold_rewards
                     retry_visible = retry_score >= self.config.threshold_button
-                    continue_visible = continue_score >= self.config.threshold_button
+                    continue_visible = continue_score >= self.config.threshold_continue
+                    decision_roi = self.config.decision_roi or self._default_decision_roi(screen)
 
                     if rewards_zero and continue_visible:
                         _, pos, size = matches["continue"]  # type: ignore[misc]
                         cx, cy = self._center(pos, size)
-                        self._click(cx, cy, "Continue / Next Stage (0 reward)")
-                        phase = "WAIT_READY"
-                        next_scan_at = time.time() + self.config.loading_wait
+                        clicked = self._click_with_verification(
+                            cx,
+                            cy,
+                            "Continue / Next Stage (0 reward)",
+                            verify_template_key="continue",
+                            verify_threshold=self.config.threshold_continue - 0.03,
+                            verify_roi=decision_roi,
+                        )
+                        if clicked:
+                            phase = "WAIT_READY"
+                            next_scan_at = time.time() + self.config.loading_wait
+                            continue
+                        next_scan_at = time.time() + self.config.scan_interval
                         continue
 
                     if rewards_left_positive and retry_visible:
                         _, pos, size = matches["retry"]  # type: ignore[misc]
                         cx, cy = self._center(pos, size)
-                        self._click(cx, cy, "Retry Stage")
-                        phase = "WAIT_READY"
-                        next_scan_at = time.time() + self.config.loading_wait
+                        clicked = self._click_with_verification(
+                            cx,
+                            cy,
+                            "Retry Stage",
+                            verify_template_key="retry",
+                            verify_threshold=self.config.threshold_button - 0.03,
+                            verify_roi=decision_roi,
+                        )
+                        if clicked:
+                            phase = "WAIT_READY"
+                            next_scan_at = time.time() + self.config.loading_wait
+                            continue
+                        next_scan_at = time.time() + self.config.scan_interval
                         continue
 
                     if (not rewards_left_positive) and continue_visible:
                         _, pos, size = matches["continue"]  # type: ignore[misc]
                         cx, cy = self._center(pos, size)
-                        self._click(cx, cy, "Continue / Next Stage")
-                        phase = "WAIT_READY"
-                        next_scan_at = time.time() + self.config.loading_wait
+                        clicked = self._click_with_verification(
+                            cx,
+                            cy,
+                            "Continue / Next Stage",
+                            verify_template_key="continue",
+                            verify_threshold=self.config.threshold_continue - 0.03,
+                            verify_roi=decision_roi,
+                        )
+                        if clicked:
+                            phase = "WAIT_READY"
+                            next_scan_at = time.time() + self.config.loading_wait
+                            continue
+                        next_scan_at = time.time() + self.config.scan_interval
                         continue
 
                     # Fallback rules when rewards text is not detected clearly.
                     if continue_visible and not retry_visible:
                         _, pos, size = matches["continue"]  # type: ignore[misc]
                         cx, cy = self._center(pos, size)
-                        self._click(cx, cy, "Continue fallback")
-                        phase = "WAIT_READY"
-                        next_scan_at = time.time() + self.config.loading_wait
+                        clicked = self._click_with_verification(
+                            cx,
+                            cy,
+                            "Continue fallback",
+                            verify_template_key="continue",
+                            verify_threshold=self.config.threshold_continue - 0.03,
+                            verify_roi=decision_roi,
+                        )
+                        if clicked:
+                            phase = "WAIT_READY"
+                            next_scan_at = time.time() + self.config.loading_wait
+                            continue
+                        next_scan_at = time.time() + self.config.scan_interval
                         continue
 
                     if retry_visible and not continue_visible:
                         _, pos, size = matches["retry"]  # type: ignore[misc]
                         cx, cy = self._center(pos, size)
-                        self._click(cx, cy, "Retry fallback")
-                        phase = "WAIT_READY"
-                        next_scan_at = time.time() + self.config.loading_wait
+                        clicked = self._click_with_verification(
+                            cx,
+                            cy,
+                            "Retry fallback",
+                            verify_template_key="retry",
+                            verify_threshold=self.config.threshold_button - 0.03,
+                            verify_roi=decision_roi,
+                        )
+                        if clicked:
+                            phase = "WAIT_READY"
+                            next_scan_at = time.time() + self.config.loading_wait
+                            continue
+                        next_scan_at = time.time() + self.config.scan_interval
                         continue
 
                     next_scan_at = time.time() + self.config.scan_interval
                     continue
 
                 if phase == "WAIT_READY":
-                    if ready_score >= self.config.threshold_button:
+                    if ready_score >= self.config.threshold_ready:
                         _, pos, size = matches["ready"]  # type: ignore[misc]
                         cx, cy = self._center(pos, size)
                         self._click(cx, cy, "Ready")
@@ -507,6 +638,18 @@ def parse_args() -> argparse.Namespace:
         help="Template score threshold for buttons (default: 0.82)",
     )
     parser.add_argument(
+        "--threshold-continue",
+        type=float,
+        default=0.60,
+        help="Template score threshold for Continue/Next Stage (default: 0.60)",
+    )
+    parser.add_argument(
+        "--threshold-ready",
+        type=float,
+        default=0.58,
+        help="Template score threshold for Ready button (default: 0.58)",
+    )
+    parser.add_argument(
         "--threshold-rewards",
         type=float,
         default=0.84,
@@ -523,6 +666,24 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=8.0,
         help="Seconds to wait after retry/continue click before scanning for ready (default: 8)",
+    )
+    parser.add_argument(
+        "--click-hold-seconds",
+        type=float,
+        default=0.06,
+        help="How long to hold mouse button on click (default: 0.06)",
+    )
+    parser.add_argument(
+        "--click-retries",
+        type=int,
+        default=3,
+        help="How many click attempts before giving up (default: 3)",
+    )
+    parser.add_argument(
+        "--verify-after-click-seconds",
+        type=float,
+        default=0.35,
+        help="Delay before post-click verification (default: 0.35)",
     )
     parser.add_argument(
         "--decision-roi",
@@ -612,9 +773,14 @@ def main() -> None:
 
     config = BotConfig(
         threshold_button=args.threshold_button,
+        threshold_continue=args.threshold_continue,
+        threshold_ready=args.threshold_ready,
         threshold_rewards=args.threshold_rewards,
         scan_interval=args.scan_interval,
         loading_wait=args.loading_wait,
+        click_hold_seconds=max(0.01, args.click_hold_seconds),
+        click_retries=max(1, args.click_retries),
+        verify_after_click_seconds=max(0.05, args.verify_after_click_seconds),
         decision_roi=decision_roi,
         ready_roi=ready_roi,
         enable_hotkeys=not args.no_hotkeys,

@@ -14,13 +14,31 @@ pip install -r requirements.txt
 ## 2) Jalankan bot
 
 ```powershell
+.\run_bot.bat
+```
+
+Atau langsung via Python:
+
+```powershell
 python bot_retry_continue.py --debug
 ```
 
 Gunakan opsi berikut bila perlu:
 
 ```powershell
-python bot_retry_continue.py --threshold-button 0.85 --threshold-rewards 0.86 --loading-wait 10
+python bot_retry_continue.py --threshold-button 0.85 --threshold-continue 0.60 --threshold-rewards 0.86 --loading-wait 10
+```
+
+Untuk kasus `0 retry left` (biasanya yang paling susah ke-detect), pakai ini dulu:
+
+```powershell
+.\run_bot.bat --threshold-button 0.80 --threshold-continue 0.58 --threshold-ready 0.56 --threshold-rewards 0.82 --debug --click-hold-seconds 0.08 --click-retries 3
+```
+
+Jika bot terlihat diam (UI scale berubah), coba turunkan threshold:
+
+```powershell
+.\run_bot.bat --threshold-button 0.72 --threshold-rewards 0.76 --debug
 ```
 
 Contoh dengan ROI (lebih stabil dan lebih cepat):
@@ -102,4 +120,37 @@ Contoh:
 
 ```powershell
 python bot_retry_continue.py --pause-hotkey "<f6>" --stop-hotkey "<f7>" --debug
+```
+
+## 8) Jika bot diam (tidak ada aksi)
+
+- Jalankan file batch langsung, jangan lewat `py`:
+
+```powershell
+.\run_bot.bat --debug
+```
+
+- Kalibrasi ROI di screen hasil stage, lalu jalankan lagi:
+
+```powershell
+.\run_bot.bat --suggest-roi --debug
+.\run_bot.bat --debug
+```
+
+- Jika masih belum klik, turunkan threshold dulu:
+
+```powershell
+.\run_bot.bat --threshold-button 0.50 --threshold-continue 0.55 --threshold-ready 0.52 --threshold-rewards 0.60 --debug
+```
+
+- Jika retry terdeteksi tapi ready belum, turunkan khusus threshold ready:
+
+```powershell
+.\run_bot.bat --threshold-ready 0.52 --debug
+```
+
+- Jika mouse cuma hover ke tombol tapi tidak benar-benar klik, gunakan mode klik kuat:
+
+```powershell
+.\run_bot.bat --click-hold-seconds 0.10 --click-retries 4 --verify-after-click-seconds 0.45 --debug
 ```
