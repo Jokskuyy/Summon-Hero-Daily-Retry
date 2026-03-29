@@ -37,6 +37,7 @@ class BotConfig:
     threshold_button: float = 0.82
     threshold_continue: float = 0.60
     threshold_ready: float = 0.58
+    threshold_ready_text: float = 0.68
     threshold_ready_relaxed: float = 0.50
     threshold_rewards: float = 0.84
     max_wait_ready_seconds: float = 25.0
@@ -47,12 +48,17 @@ class BotConfig:
     click_hold_seconds: float = 0.06
     click_retries: int = 3
     verify_after_click_seconds: float = 0.35
+    hover_jiggle_enabled: bool = True
+    hover_jiggle_pixels: int = 10
+    hover_jiggle_delay: float = 0.02
     decision_roi: Optional[ROI] = None
     ready_roi: Optional[ROI] = None
+    enable_ready_click: bool = False
     enable_hotkeys: bool = True
     pause_hotkey: str = "<f8>"
     stop_hotkey: str = "<f9>"
     template_scales: Tuple[float, ...] = (0.78, 0.88, 1.0, 1.12, 1.25)
+    ready_template_scales: Tuple[float, ...] = (0.92, 1.0, 1.08, 1.16)
     debug: bool = False
     dry_run: bool = False
 
@@ -112,10 +118,24 @@ class AdventureBot:
     def __init__(self, images_dir: Path, config: BotConfig):
         self.images_dir = images_dir
         self.config = config
+
+        ready_templates = self._load_templates_any([
+            "*Ready Button*",
+            "*Ready-Button*",
+            "*ReadyBtn*",
+        ])
+        if len(ready_templates) == 0:
+            ready_templates = self._load_templates("*Ready*")
+
+        ready_text_templates = self._load_templates_any(
+            ["*Ready Text*", "*Ready-Text*", "*ready_text*"]
+        )
+
         self.templates: Dict[str, List[np.ndarray]] = {
             "retry": self._load_templates("*Retry*"),
             "continue": self._load_templates_any(["*Continue*", "*Next Stage*"]),
-            "ready": self._load_templates("*Ready*"),
+            "ready": ready_templates,
+            "ready_text": ready_text_templates,
             "rewards_positive": self._load_templates("*rewards left*"),
             "rewards_zero": self._load_templates_any(
                 ["*0 rewards*", "*zero rewards*", "*no rewards*"]
@@ -190,27 +210,32 @@ class AdventureBot:
     @staticmethod
     def _default_ready_roi(screen: np.ndarray) -> ROI:
         h, w = screen.shape[:2]
-        # Keep this wide; ready position can drift between stages/resolutions.
-        x = int(w * 0.08)
-        y = int(h * 0.30)
-        rw = int(w * 0.84)
-        rh = int(h * 0.65)
+        # Ready button appears in upper-to-middle section; avoid lower-half HP/UI bars.
+        x = int(w * 0.06)
+        y = int(h * 0.05)
+        rw = int(w * 0.88)
+        rh = int(h * 0.55)
         return (x, y, rw, rh)
 
     def _find_best(
-        self, screen: np.ndarray, templates: List[np.ndarray], roi: Optional[ROI] = None
+        self,
+        screen: np.ndarray,
+        templates: List[np.ndarray],
+        roi: Optional[ROI] = None,
+        scales: Optional[Tuple[float, ...]] = None,
     ) -> Optional[MatchResult]:
         if len(templates) == 0:
             return None
 
         search_img, (off_x, off_y) = self._crop_by_roi(screen, roi)
         search_gray = cv2.cvtColor(search_img, cv2.COLOR_BGR2GRAY)
+        use_scales = scales if scales is not None else self.config.template_scales
         best_score = -1.0
         best_pos = (0, 0)
         best_size = (0, 0)
 
         for template in templates:
-            for scale in self.config.template_scales:
+            for scale in use_scales:
                 if scale == 1.0:
                     tpl = template
                 else:
@@ -246,6 +271,22 @@ class AdventureBot:
             return
 
         clicker.moveTo(x, y)
+        if self.config.hover_jiggle_enabled:
+            j = max(1, self.config.hover_jiggle_pixels)
+            d = max(0.0, self.config.hover_jiggle_delay)
+            # Small motion around target to trigger hover-highlight states before click.
+            path = [
+                (x + j, y),
+                (x - j, y),
+                (x, y - j),
+                (x, y + j),
+                (x, y),
+            ]
+            for px, py in path:
+                clicker.moveTo(px, py)
+                if d > 0:
+                    time.sleep(d)
+
         try:
             # Press and release explicitly; Roblox sometimes ignores fast click().
             clicker.mouseDown(x=x, y=y)
@@ -286,6 +327,12 @@ class AdventureBot:
 
         print(f"[WARN] {reason} failed after {self.config.click_retries} attempts.")
         return False
+
+    def _next_phase_after_stage_click(self) -> Tuple[str, float]:
+        # Optionally skip Ready flow and just continue with decision loop after loading.
+        if self.config.enable_ready_click:
+            return ("WAIT_READY", time.time() + self.config.loading_wait)
+        return ("DECIDE", time.time() + self.config.loading_wait)
 
     @staticmethod
     def _match_box(match: MatchResult) -> ROI:
@@ -341,13 +388,25 @@ class AdventureBot:
         continue_match = self._find_best(
             screen, self.templates["continue"], decision_roi
         )
-        ready_match = self._find_best(screen, self.templates["ready"], ready_roi)
+        ready_match = self._find_best(
+            screen,
+            self.templates["ready"],
+            ready_roi,
+            scales=self.config.ready_template_scales,
+        )
+        ready_text_match = self._find_best(
+            screen,
+            self.templates["ready_text"],
+            ready_roi,
+            scales=(0.82, 0.92, 1.0, 1.1, 1.2),
+        )
 
         self._log_match("rewards_positive", rewards_match)
         self._log_match("rewards_zero", rewards_zero_match)
         self._log_match("retry", retry_match)
         self._log_match("continue", continue_match)
         self._log_match("ready", ready_match)
+        self._log_match("ready_text", ready_text_match)
 
         return {
             "rewards_positive": rewards_match,
@@ -355,11 +414,61 @@ class AdventureBot:
             "retry": retry_match,
             "continue": continue_match,
             "ready": ready_match,
+            "ready_text": ready_text_match,
         }
 
     @staticmethod
     def _score(match: Optional[MatchResult]) -> float:
         return match[0] if match else 0.0
+
+    def _is_valid_ready_candidate(self, match: Optional[MatchResult], screen: np.ndarray) -> bool:
+        if match is None:
+            return False
+
+        _score, (x, y), (w, h) = match
+        sh, sw = screen.shape[:2]
+        min_tpl_w = min(t.shape[1] for t in self.templates["ready"])
+        min_tpl_h = min(t.shape[0] for t in self.templates["ready"])
+        cx = x + (w // 2)
+        cy = y + (h // 2)
+
+        # Reject tiny/skinny matches and top overlays (e.g., green UI bars) that are not the Ready button.
+        if w < int(min_tpl_w * 0.65) or h < int(min_tpl_h * 0.65):
+            return False
+        if y < int(sh * 0.18):
+            return False
+        if cy > int(sh * 0.68):
+            return False
+        if cx < int(sw * 0.18) or cx > int(sw * 0.82):
+            return False
+
+        aspect = w / max(1, h)
+        if aspect < 1.6 or aspect > 9.5:
+            return False
+
+        return True
+
+    def _is_valid_ready_text_candidate(self, match: Optional[MatchResult], screen: np.ndarray) -> bool:
+        if match is None:
+            return False
+
+        _score, (x, y), (w, h) = match
+        sh, sw = screen.shape[:2]
+        cx = x + (w // 2)
+        cy = y + (h // 2)
+
+        if w < int(sw * 0.04) or h < int(sh * 0.015):
+            return False
+        if cy > int(sh * 0.68):
+            return False
+        if cx < int(sw * 0.18) or cx > int(sw * 0.82):
+            return False
+
+        aspect = w / max(1, h)
+        if aspect < 2.0 or aspect > 9.5:
+            return False
+
+        return True
 
     def run(self) -> None:
         print("=== Roblox Adventure Retry/Continue Bot ===")
@@ -367,10 +476,16 @@ class AdventureBot:
         print(f"Threshold button: {self.config.threshold_button}")
         print(f"Threshold continue: {self.config.threshold_continue}")
         print(f"Threshold ready: {self.config.threshold_ready}")
+        print(f"Threshold ready text: {self.config.threshold_ready_text}")
         print(f"Threshold ready relaxed: {self.config.threshold_ready_relaxed}")
         print(f"Threshold rewards: {self.config.threshold_rewards}")
         print(f"Max wait ready: {self.config.max_wait_ready_seconds}s")
         print(f"Click retries: {self.config.click_retries}")
+        print(
+            f"Hover jiggle: {'on' if self.config.hover_jiggle_enabled else 'off'}"
+            f" (pixels={self.config.hover_jiggle_pixels}, delay={self.config.hover_jiggle_delay})"
+        )
+        print(f"Enable ready click: {self.config.enable_ready_click}")
         print(f"Decision ROI: {self.config.decision_roi}")
         print(f"Ready ROI: {self.config.ready_roi}")
         print(f"Dry run: {self.config.dry_run}")
@@ -416,6 +531,11 @@ class AdventureBot:
                 retry_score = self._score(matches["retry"])
                 continue_score = self._score(matches["continue"])
                 ready_score = self._score(matches["ready"])
+                ready_text_score = self._score(matches["ready_text"])
+                ready_candidate_valid = self._is_valid_ready_candidate(matches["ready"], screen)
+                ready_text_candidate_valid = self._is_valid_ready_text_candidate(
+                    matches["ready_text"], screen
+                )
                 retry_visible = retry_score >= self.config.threshold_button
                 continue_visible = continue_score >= self.config.threshold_continue
 
@@ -435,9 +555,8 @@ class AdventureBot:
                             verify_roi=decision_roi,
                         )
                         if clicked:
-                            phase = "WAIT_READY"
+                            phase, next_scan_at = self._next_phase_after_stage_click()
                             phase_started_at = time.time()
-                            next_scan_at = time.time() + self.config.loading_wait
                             continue
                         next_scan_at = time.time() + self.config.scan_interval
                         continue
@@ -454,9 +573,8 @@ class AdventureBot:
                             verify_roi=decision_roi,
                         )
                         if clicked:
-                            phase = "WAIT_READY"
+                            phase, next_scan_at = self._next_phase_after_stage_click()
                             phase_started_at = time.time()
-                            next_scan_at = time.time() + self.config.loading_wait
                             continue
                         next_scan_at = time.time() + self.config.scan_interval
                         continue
@@ -473,9 +591,8 @@ class AdventureBot:
                             verify_roi=decision_roi,
                         )
                         if clicked:
-                            phase = "WAIT_READY"
+                            phase, next_scan_at = self._next_phase_after_stage_click()
                             phase_started_at = time.time()
-                            next_scan_at = time.time() + self.config.loading_wait
                             continue
                         next_scan_at = time.time() + self.config.scan_interval
                         continue
@@ -493,9 +610,8 @@ class AdventureBot:
                             verify_roi=decision_roi,
                         )
                         if clicked:
-                            phase = "WAIT_READY"
+                            phase, next_scan_at = self._next_phase_after_stage_click()
                             phase_started_at = time.time()
-                            next_scan_at = time.time() + self.config.loading_wait
                             continue
                         next_scan_at = time.time() + self.config.scan_interval
                         continue
@@ -512,9 +628,8 @@ class AdventureBot:
                             verify_roi=decision_roi,
                         )
                         if clicked:
-                            phase = "WAIT_READY"
+                            phase, next_scan_at = self._next_phase_after_stage_click()
                             phase_started_at = time.time()
-                            next_scan_at = time.time() + self.config.loading_wait
                             continue
                         next_scan_at = time.time() + self.config.scan_interval
                         continue
@@ -529,6 +644,16 @@ class AdventureBot:
                         effective_ready_threshold = min(
                             self.config.threshold_ready, self.config.threshold_ready_relaxed
                         )
+
+                    ready_signal_ok = ready_score >= effective_ready_threshold and ready_candidate_valid
+                    ready_text_signal_ok = (
+                        ready_text_score >= self.config.threshold_ready_text
+                        and ready_text_candidate_valid
+                    )
+
+                    chosen_ready_match = matches["ready"]
+                    if (not ready_signal_ok) and ready_text_signal_ok:
+                        chosen_ready_match = matches["ready_text"]
 
                     # Recovery: if result buttons appear again, previous click likely failed.
                     if retry_visible or continue_visible:
@@ -545,8 +670,8 @@ class AdventureBot:
                         next_scan_at = time.time() + self.config.scan_interval
                         continue
 
-                    if ready_score >= effective_ready_threshold:
-                        _, pos, size = matches["ready"]  # type: ignore[misc]
+                    if ready_signal_ok or ready_text_signal_ok:
+                        _, pos, size = chosen_ready_match  # type: ignore[misc]
                         cx, cy = self._center(pos, size)
                         clicked = self._click_with_verification(
                             cx,
@@ -564,6 +689,14 @@ class AdventureBot:
 
                         next_scan_at = time.time() + self.config.scan_interval
                         continue
+
+                    if ready_score >= effective_ready_threshold and not ready_candidate_valid:
+                        print("[RECOVERY] Ready-like match ignored (invalid geometry/position).")
+                    if (
+                        ready_text_score >= self.config.threshold_ready_text
+                        and not ready_text_candidate_valid
+                    ):
+                        print("[RECOVERY] Ready-text-like match ignored (invalid geometry/position).")
 
                     next_scan_at = time.time() + self.config.scan_interval
                     continue
@@ -696,6 +829,12 @@ def parse_args() -> argparse.Namespace:
         help="Template score threshold for Ready button (default: 0.58)",
     )
     parser.add_argument(
+        "--threshold-ready-text",
+        type=float,
+        default=0.68,
+        help="Template score threshold for Ready text templates (default: 0.68)",
+    )
+    parser.add_argument(
         "--threshold-ready-relaxed",
         type=float,
         default=0.50,
@@ -748,6 +887,33 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.35,
         help="Delay before post-click verification (default: 0.35)",
+    )
+    parser.add_argument(
+        "--hover-jiggle-enabled",
+        action="store_true",
+        help="Enable small hover jiggle before click (default: enabled)",
+    )
+    parser.add_argument(
+        "--no-hover-jiggle",
+        action="store_true",
+        help="Disable small hover jiggle before click",
+    )
+    parser.add_argument(
+        "--hover-jiggle-pixels",
+        type=int,
+        default=10,
+        help="Hover jiggle offset in pixels (default: 10)",
+    )
+    parser.add_argument(
+        "--hover-jiggle-delay",
+        type=float,
+        default=0.02,
+        help="Delay between hover jiggle moves in seconds (default: 0.02)",
+    )
+    parser.add_argument(
+        "--enable-ready-click",
+        action="store_true",
+        help="Enable Ready button clicking flow (default: disabled)",
     )
     parser.add_argument(
         "--decision-roi",
@@ -839,6 +1005,7 @@ def main() -> None:
         threshold_button=args.threshold_button,
         threshold_continue=args.threshold_continue,
         threshold_ready=args.threshold_ready,
+        threshold_ready_text=args.threshold_ready_text,
         threshold_ready_relaxed=args.threshold_ready_relaxed,
         threshold_rewards=args.threshold_rewards,
         max_wait_ready_seconds=max(5.0, args.max_wait_ready_seconds),
@@ -848,8 +1015,12 @@ def main() -> None:
         click_hold_seconds=max(0.01, args.click_hold_seconds),
         click_retries=max(1, args.click_retries),
         verify_after_click_seconds=max(0.05, args.verify_after_click_seconds),
+        hover_jiggle_enabled=(not args.no_hover_jiggle) or args.hover_jiggle_enabled,
+        hover_jiggle_pixels=max(1, args.hover_jiggle_pixels),
+        hover_jiggle_delay=max(0.0, args.hover_jiggle_delay),
         decision_roi=decision_roi,
         ready_roi=ready_roi,
+        enable_ready_click=args.enable_ready_click,
         enable_hotkeys=not args.no_hotkeys,
         pause_hotkey=args.pause_hotkey,
         stop_hotkey=args.stop_hotkey,
