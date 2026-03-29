@@ -36,18 +36,33 @@ ROI = Tuple[int, int, int, int]
 class BotConfig:
     threshold_button: float = 0.82
     threshold_continue: float = 0.60
+    threshold_ready: float = 0.54
+    threshold_ready_text: float = 0.66
     threshold_rewards: float = 0.84
+    max_wait_ready_seconds: float = 18.0
     scan_interval: float = 0.35
     post_click_sleep: float = 1.6
     loading_wait: float = 8.0
     click_hold_seconds: float = 0.06
     click_retries: int = 3
     verify_after_click_seconds: float = 0.35
+    ready_verify_after_click_seconds: float = 0.55
+    ready_verify_min_drop: float = 0.22
     hover_jiggle_enabled: bool = True
     hover_jiggle_pixels: int = 10
     hover_jiggle_delay: float = 0.02
+    continue_green_min_ratio: float = 0.16
+    retry_blue_min_ratio: float = 0.14
+    ready_green_min_ratio: float = 0.12
+    button_white_text_min_ratio: float = 0.018
+    stage_min_y_ratio: float = 0.62
+    stage_max_y_ratio: float = 0.94
+    stage_min_x_ratio: float = 0.24
+    stage_max_x_ratio: float = 0.76
     decision_roi: Optional[ROI] = None
     ready_roi: Optional[ROI] = None
+    ready_only_mode: bool = False
+    enable_ready_click: bool = True
     enable_hotkeys: bool = True
     pause_hotkey: str = "<f8>"
     stop_hotkey: str = "<f9>"
@@ -155,7 +170,10 @@ class AdventureBot:
         return loaded
 
     def _validate_templates(self) -> None:
-        required = ["retry", "continue", "ready", "rewards_positive"]
+        if self.config.ready_only_mode:
+            required = ["ready"]
+        else:
+            required = ["retry", "continue", "ready", "rewards_positive"]
         missing = [key for key in required if len(self.templates[key]) == 0]
         if missing:
             missing_str = ", ".join(missing)
@@ -322,6 +340,92 @@ class AdventureBot:
         print(f"[WARN] {reason} failed after {self.config.click_retries} attempts.")
         return False
 
+    def _next_phase_after_stage_click(self) -> Tuple[str, float]:
+        if self.config.enable_ready_click:
+            return ("WAIT_READY", time.time() + self.config.loading_wait)
+        return ("DECIDE", time.time() + self.config.loading_wait)
+
+    def _is_ready_signal_valid(
+        self,
+        ready_match: Optional[MatchResult],
+        ready_text_match: Optional[MatchResult],
+        screen: np.ndarray,
+    ) -> bool:
+        ready_score = self._score(ready_match)
+        ready_text_score = self._score(ready_text_match)
+
+        ready_candidate_valid = self._is_valid_ready_candidate(ready_match, screen)
+        ready_text_candidate_valid = self._is_valid_ready_text_candidate(ready_text_match, screen)
+
+        ready_green, _ready_blue, ready_white = self._color_ratios_for_candidate(ready_match, screen)
+        _rt_green, _rt_blue, ready_text_white = self._color_ratios_for_candidate(
+            ready_text_match, screen
+        )
+
+        ready_signal_ok = (
+            ready_score >= self.config.threshold_ready
+            and ready_candidate_valid
+            and ready_green >= self.config.ready_green_min_ratio
+            and ready_white >= self.config.button_white_text_min_ratio
+        )
+        ready_text_signal_ok = (
+            ready_text_score >= self.config.threshold_ready_text
+            and ready_text_candidate_valid
+            and ready_text_white >= self.config.button_white_text_min_ratio
+        )
+        return ready_signal_ok or ready_text_signal_ok
+
+    def _click_ready_with_verification(
+        self,
+        x: int,
+        y: int,
+        pre_ready_score: float,
+        ready_roi: Optional[ROI],
+    ) -> bool:
+        verify_wait = max(
+            self.config.verify_after_click_seconds,
+            self.config.ready_verify_after_click_seconds,
+        )
+
+        for attempt in range(1, max(1, self.config.click_retries) + 1):
+            self._click(x, y, f"Ready (attempt {attempt})")
+            if self.config.dry_run:
+                return True
+
+            time.sleep(verify_wait)
+            post_screen = self._capture_screen()
+            post_ready_match = self._find_best(
+                post_screen,
+                self.templates["ready"],
+                ready_roi,
+                scales=self.config.ready_template_scales,
+            )
+            post_ready_text_match = self._find_best(
+                post_screen,
+                self.templates["ready_text"],
+                ready_roi,
+                scales=(0.82, 0.92, 1.0, 1.1, 1.2),
+            )
+            post_ready_score = self._score(post_ready_match)
+            ready_signal_still_valid = self._is_ready_signal_valid(
+                post_ready_match, post_ready_text_match, post_screen
+            )
+
+            if not ready_signal_still_valid:
+                return True
+
+            score_drop = pre_ready_score - post_ready_score
+            if score_drop >= self.config.ready_verify_min_drop:
+                return True
+
+            print(
+                f"[WARN] Ready not confirmed (score={post_ready_score:.3f}, drop={score_drop:.3f}, "
+                f"min_drop={self.config.ready_verify_min_drop:.3f})."
+            )
+
+        print(f"[WARN] Ready failed after {self.config.click_retries} attempts.")
+        return False
+
     @staticmethod
     def _match_box(match: MatchResult) -> ROI:
         _score, (x, y), (w, h) = match
@@ -364,6 +468,7 @@ class AdventureBot:
 
     def _detect_state(self, screen: np.ndarray) -> Dict[str, Optional[MatchResult]]:
         decision_roi = self.config.decision_roi or self._default_decision_roi(screen)
+        ready_roi = self.config.ready_roi or self._default_ready_roi(screen)
 
         rewards_match = self._find_best(
             screen, self.templates["rewards_positive"], decision_roi
@@ -375,22 +480,96 @@ class AdventureBot:
         continue_match = self._find_best(
             screen, self.templates["continue"], decision_roi
         )
+        ready_match = self._find_best(
+            screen,
+            self.templates["ready"],
+            ready_roi,
+            scales=self.config.ready_template_scales,
+        )
+        ready_text_match = self._find_best(
+            screen,
+            self.templates["ready_text"],
+            ready_roi,
+            scales=(0.82, 0.92, 1.0, 1.1, 1.2),
+        )
 
         self._log_match("rewards_positive", rewards_match)
         self._log_match("rewards_zero", rewards_zero_match)
         self._log_match("retry", retry_match)
         self._log_match("continue", continue_match)
+        self._log_match("ready", ready_match)
+        self._log_match("ready_text", ready_text_match)
 
         return {
             "rewards_positive": rewards_match,
             "rewards_zero": rewards_zero_match,
             "retry": retry_match,
             "continue": continue_match,
+            "ready": ready_match,
+            "ready_text": ready_text_match,
         }
 
     @staticmethod
     def _score(match: Optional[MatchResult]) -> float:
         return match[0] if match else 0.0
+
+    def _is_valid_stage_button_candidate(
+        self, match: Optional[MatchResult], screen: np.ndarray
+    ) -> bool:
+        if match is None:
+            return False
+
+        _score, (x, y), (w, h) = match
+        sh, sw = screen.shape[:2]
+        cx = x + (w // 2)
+        cy = y + (h // 2)
+
+        # Result action buttons are expected in lower-middle area.
+        if cy < int(sh * self.config.stage_min_y_ratio) or cy > int(sh * self.config.stage_max_y_ratio):
+            return False
+        if cx < int(sw * self.config.stage_min_x_ratio) or cx > int(sw * self.config.stage_max_x_ratio):
+            return False
+
+        if w < int(sw * 0.05) or h < int(sh * 0.02):
+            return False
+
+        aspect = w / max(1, h)
+        if aspect < 2.0 or aspect > 7.0:
+            return False
+
+        return True
+
+    def _color_ratios_for_candidate(
+        self, match: Optional[MatchResult], screen: np.ndarray
+    ) -> Tuple[float, float, float]:
+        if match is None:
+            return (0.0, 0.0, 0.0)
+
+        _score, (x, y), (w, h) = match
+        sh, sw = screen.shape[:2]
+        x1 = max(0, x)
+        y1 = max(0, y)
+        x2 = min(sw, x + w)
+        y2 = min(sh, y + h)
+        if x2 <= x1 or y2 <= y1:
+            return (0.0, 0.0, 0.0)
+
+        crop = screen[y1:y2, x1:x2]
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+
+        # OpenCV Hue range is [0,179].
+        green_mask = cv2.inRange(hsv, (35, 70, 70), (90, 255, 255))
+        blue_mask = cv2.inRange(hsv, (95, 70, 70), (135, 255, 255))
+        white_mask = cv2.inRange(hsv, (0, 0, 190), (179, 50, 255))
+
+        total = float(crop.shape[0] * crop.shape[1])
+        if total <= 0:
+            return (0.0, 0.0, 0.0)
+
+        green_ratio = float(cv2.countNonZero(green_mask)) / total
+        blue_ratio = float(cv2.countNonZero(blue_mask)) / total
+        white_ratio = float(cv2.countNonZero(white_mask)) / total
+        return (green_ratio, blue_ratio, white_ratio)
 
     def _is_valid_ready_candidate(self, match: Optional[MatchResult], screen: np.ndarray) -> bool:
         if match is None:
@@ -446,13 +625,33 @@ class AdventureBot:
         print(f"Templates folder: {self.images_dir}")
         print(f"Threshold button: {self.config.threshold_button}")
         print(f"Threshold continue: {self.config.threshold_continue}")
+        print(f"Threshold ready: {self.config.threshold_ready}")
+        print(f"Threshold ready text: {self.config.threshold_ready_text}")
         print(f"Threshold rewards: {self.config.threshold_rewards}")
+        print(f"Max wait ready: {self.config.max_wait_ready_seconds}s")
         print(f"Click retries: {self.config.click_retries}")
+        print(
+            f"Ready verify: wait={self.config.ready_verify_after_click_seconds}s, "
+            f"min_drop={self.config.ready_verify_min_drop}"
+        )
+        print(
+            f"Color gate: continue_green>={self.config.continue_green_min_ratio}, "
+            f"retry_blue>={self.config.retry_blue_min_ratio}, "
+            f"white_text>={self.config.button_white_text_min_ratio}"
+        )
+        print(f"Ready color gate: green>={self.config.ready_green_min_ratio}")
+        print(
+            f"Stage zone gate: x={self.config.stage_min_x_ratio:.2f}-{self.config.stage_max_x_ratio:.2f}, "
+            f"y={self.config.stage_min_y_ratio:.2f}-{self.config.stage_max_y_ratio:.2f}"
+        )
         print(
             f"Hover jiggle: {'on' if self.config.hover_jiggle_enabled else 'off'}"
             f" (pixels={self.config.hover_jiggle_pixels}, delay={self.config.hover_jiggle_delay})"
         )
         print(f"Decision ROI: {self.config.decision_roi}")
+        print(f"Ready ROI: {self.config.ready_roi}")
+        print(f"Ready only mode: {self.config.ready_only_mode}")
+        print(f"Enable ready click: {self.config.enable_ready_click}")
         print(f"Dry run: {self.config.dry_run}")
         print(
             f"Hotkeys: {'on' if self.config.enable_hotkeys else 'off'}"
@@ -467,6 +666,8 @@ class AdventureBot:
         )
         runtime.start()
 
+        phase = "DECIDE"
+        phase_started_at = time.time()
         next_scan_at = time.time()
 
         try:
@@ -484,6 +685,79 @@ class AdventureBot:
                     time.sleep(0.02)
                     continue
 
+                if self.config.ready_only_mode:
+                    screen = self._capture_screen()
+                    ready_match = self._find_best(
+                        screen,
+                        self.templates["ready"],
+                        self.config.ready_roi,
+                        scales=self.config.ready_template_scales,
+                    )
+                    ready_text_match = self._find_best(
+                        screen,
+                        self.templates["ready_text"],
+                        self.config.ready_roi,
+                        scales=(0.82, 0.92, 1.0, 1.1, 1.2),
+                    )
+
+                    self._log_match("ready", ready_match)
+                    self._log_match("ready_text", ready_text_match)
+
+                    ready_score = self._score(ready_match)
+                    ready_text_score = self._score(ready_text_match)
+                    ready_candidate_valid = self._is_valid_ready_candidate(ready_match, screen)
+                    ready_text_candidate_valid = self._is_valid_ready_text_candidate(
+                        ready_text_match, screen
+                    )
+                    ready_green, _ready_blue, ready_white = self._color_ratios_for_candidate(
+                        ready_match, screen
+                    )
+                    _rt_green, _rt_blue, ready_text_white = self._color_ratios_for_candidate(
+                        ready_text_match, screen
+                    )
+
+                    ready_signal_ok = (
+                        ready_score >= self.config.threshold_ready
+                        and ready_candidate_valid
+                        and ready_green >= self.config.ready_green_min_ratio
+                        and ready_white >= self.config.button_white_text_min_ratio
+                    )
+                    ready_text_signal_ok = (
+                        ready_text_score >= self.config.threshold_ready_text
+                        and ready_text_candidate_valid
+                        and ready_text_white >= self.config.button_white_text_min_ratio
+                    )
+
+                    chosen_ready_match: Optional[MatchResult] = None
+                    if ready_signal_ok:
+                        chosen_ready_match = ready_match
+                    elif ready_text_signal_ok:
+                        chosen_ready_match = ready_text_match
+
+                    if chosen_ready_match is not None:
+                        _, pos, size = chosen_ready_match
+                        cx, cy = self._center(pos, size)
+                        clicked = self._click_ready_with_verification(
+                            cx, cy, ready_score, self.config.ready_roi
+                        )
+                        if clicked:
+                            next_scan_at = time.time() + self.config.post_click_sleep
+                            continue
+
+                    if ready_score >= self.config.threshold_ready and not ready_signal_ok:
+                        print(
+                            f"[RECOVERY] Ready-like match ignored. score={ready_score:.3f}, "
+                            f"green={ready_green:.3f}, white={ready_white:.3f}"
+                        )
+                    if ready_text_score >= self.config.threshold_ready_text and not ready_text_signal_ok:
+                        print(
+                            f"[RECOVERY] Ready-text-like match ignored. score={ready_text_score:.3f}, "
+                            f"white={ready_text_white:.3f}"
+                        )
+
+                    next_scan_at = time.time() + self.config.scan_interval
+                    continue
+
                 screen = self._capture_screen()
                 matches = self._detect_state(screen)
                 decision_roi = self.config.decision_roi or self._default_decision_roi(screen)
@@ -492,8 +766,134 @@ class AdventureBot:
                 rewards_zero_score = self._score(matches["rewards_zero"])
                 retry_score = self._score(matches["retry"])
                 continue_score = self._score(matches["continue"])
-                retry_visible = retry_score >= self.config.threshold_button
-                continue_visible = continue_score >= self.config.threshold_continue
+                ready_score = self._score(matches["ready"])
+                ready_text_score = self._score(matches["ready_text"])
+                retry_candidate_valid = self._is_valid_stage_button_candidate(
+                    matches["retry"], screen
+                )
+                continue_candidate_valid = self._is_valid_stage_button_candidate(
+                    matches["continue"], screen
+                )
+                ready_candidate_valid = self._is_valid_ready_candidate(matches["ready"], screen)
+                ready_text_candidate_valid = self._is_valid_ready_text_candidate(
+                    matches["ready_text"], screen
+                )
+                cont_green, cont_blue, cont_white = self._color_ratios_for_candidate(
+                    matches["continue"], screen
+                )
+                ret_green, ret_blue, ret_white = self._color_ratios_for_candidate(
+                    matches["retry"], screen
+                )
+                ready_green, _ready_blue, ready_white = self._color_ratios_for_candidate(
+                    matches["ready"], screen
+                )
+                _rt_green, _rt_blue, ready_text_white = self._color_ratios_for_candidate(
+                    matches["ready_text"], screen
+                )
+
+                continue_color_ok = (
+                    cont_green >= self.config.continue_green_min_ratio
+                    and cont_white >= self.config.button_white_text_min_ratio
+                )
+                retry_color_ok = (
+                    ret_blue >= self.config.retry_blue_min_ratio
+                    and ret_white >= self.config.button_white_text_min_ratio
+                )
+
+                retry_visible = (
+                    retry_score >= self.config.threshold_button
+                    and retry_candidate_valid
+                    and retry_color_ok
+                )
+                continue_visible = (
+                    continue_score >= self.config.threshold_continue
+                    and continue_candidate_valid
+                    and continue_color_ok
+                )
+
+                if (
+                    continue_score >= self.config.threshold_continue
+                    and not continue_candidate_valid
+                ):
+                    print("[RECOVERY] Continue-like match ignored (outside expected button zone).")
+                if continue_score >= self.config.threshold_continue and not continue_color_ok:
+                    print(
+                        f"[RECOVERY] Continue-like match ignored (color gate). "
+                        f"green={cont_green:.3f}, white={cont_white:.3f}"
+                    )
+                if retry_score >= self.config.threshold_button and not retry_candidate_valid:
+                    print("[RECOVERY] Retry-like match ignored (outside expected button zone).")
+                if retry_score >= self.config.threshold_button and not retry_color_ok:
+                    print(
+                        f"[RECOVERY] Retry-like match ignored (color gate). "
+                        f"blue={ret_blue:.3f}, white={ret_white:.3f}"
+                    )
+
+                if phase == "WAIT_READY":
+                    waited = time.time() - phase_started_at
+
+                    # Recovery to DECIDE when wait is too long.
+                    if waited >= self.config.max_wait_ready_seconds:
+                        print("[RECOVERY] WAIT_READY timeout reached. Returning to DECIDE.")
+                        phase = "DECIDE"
+                        phase_started_at = time.time()
+                        next_scan_at = time.time() + self.config.scan_interval
+                        continue
+
+                    # If result buttons are visible again, loading likely failed or ended.
+                    if retry_visible or continue_visible:
+                        print("[RECOVERY] Result buttons visible while waiting ready. Returning to DECIDE.")
+                        phase = "DECIDE"
+                        phase_started_at = time.time()
+                        next_scan_at = time.time() + self.config.scan_interval
+                        continue
+
+                    ready_color_ok = (
+                        ready_green >= self.config.ready_green_min_ratio
+                        and ready_white >= self.config.button_white_text_min_ratio
+                    )
+                    ready_signal_ok = (
+                        ready_score >= self.config.threshold_ready
+                        and ready_candidate_valid
+                        and ready_color_ok
+                    )
+
+                    ready_text_signal_ok = (
+                        ready_text_score >= self.config.threshold_ready_text
+                        and ready_text_candidate_valid
+                        and ready_text_white >= self.config.button_white_text_min_ratio
+                    )
+
+                    chosen_ready_key = "ready"
+                    if not ready_signal_ok and ready_text_signal_ok:
+                        chosen_ready_key = "ready_text"
+
+                    if ready_signal_ok or ready_text_signal_ok:
+                        _, pos, size = matches[chosen_ready_key]  # type: ignore[misc]
+                        cx, cy = self._center(pos, size)
+                        ready_roi = self.config.ready_roi or self._default_ready_roi(screen)
+                        clicked = self._click_ready_with_verification(
+                            cx, cy, ready_score, ready_roi
+                        )
+                        if clicked:
+                            phase = "DECIDE"
+                            phase_started_at = time.time()
+                            next_scan_at = time.time() + self.config.post_click_sleep
+                            continue
+
+                    if ready_score >= self.config.threshold_ready and not ready_signal_ok:
+                        print(
+                            f"[RECOVERY] Ready-like match ignored. score={ready_score:.3f}, "
+                            f"green={ready_green:.3f}, white={ready_white:.3f}"
+                        )
+                    if ready_text_score >= self.config.threshold_ready_text and not ready_text_signal_ok:
+                        print(
+                            f"[RECOVERY] Ready-text-like match ignored. score={ready_text_score:.3f}, "
+                            f"white={ready_text_white:.3f}"
+                        )
+
+                    next_scan_at = time.time() + self.config.scan_interval
+                    continue
 
                 rewards_left_positive = rewards_score >= self.config.threshold_rewards
                 rewards_zero = rewards_zero_score >= self.config.threshold_rewards
@@ -510,7 +910,8 @@ class AdventureBot:
                         verify_roi=decision_roi,
                     )
                     if clicked:
-                        next_scan_at = time.time() + self.config.loading_wait
+                        phase, next_scan_at = self._next_phase_after_stage_click()
+                        phase_started_at = time.time()
                         continue
                     next_scan_at = time.time() + self.config.scan_interval
                     continue
@@ -527,7 +928,8 @@ class AdventureBot:
                         verify_roi=decision_roi,
                     )
                     if clicked:
-                        next_scan_at = time.time() + self.config.loading_wait
+                        phase, next_scan_at = self._next_phase_after_stage_click()
+                        phase_started_at = time.time()
                         continue
                     next_scan_at = time.time() + self.config.scan_interval
                     continue
@@ -544,7 +946,8 @@ class AdventureBot:
                         verify_roi=decision_roi,
                     )
                     if clicked:
-                        next_scan_at = time.time() + self.config.loading_wait
+                        phase, next_scan_at = self._next_phase_after_stage_click()
+                        phase_started_at = time.time()
                         continue
                     next_scan_at = time.time() + self.config.scan_interval
                     continue
@@ -562,7 +965,8 @@ class AdventureBot:
                         verify_roi=decision_roi,
                     )
                     if clicked:
-                        next_scan_at = time.time() + self.config.loading_wait
+                        phase, next_scan_at = self._next_phase_after_stage_click()
+                        phase_started_at = time.time()
                         continue
                     next_scan_at = time.time() + self.config.scan_interval
                     continue
@@ -579,7 +983,8 @@ class AdventureBot:
                         verify_roi=decision_roi,
                     )
                     if clicked:
-                        next_scan_at = time.time() + self.config.loading_wait
+                        phase, next_scan_at = self._next_phase_after_stage_click()
+                        phase_started_at = time.time()
                         continue
                     next_scan_at = time.time() + self.config.scan_interval
                     continue
@@ -709,6 +1114,18 @@ def parse_args() -> argparse.Namespace:
         help="Template score threshold for Continue/Next Stage (default: 0.60)",
     )
     parser.add_argument(
+        "--threshold-ready",
+        type=float,
+        default=0.54,
+        help="Template score threshold for Ready button (default: 0.54)",
+    )
+    parser.add_argument(
+        "--threshold-ready-text",
+        type=float,
+        default=0.66,
+        help="Template score threshold for Ready text (default: 0.66)",
+    )
+    parser.add_argument(
         "--threshold-rewards",
         type=float,
         default=0.84,
@@ -724,7 +1141,13 @@ def parse_args() -> argparse.Namespace:
         "--loading-wait",
         type=float,
         default=8.0,
-        help="Seconds to wait after retry/continue click before next decision scan (default: 8)",
+        help="Seconds to wait after retry/continue click before checking Ready (default: 8)",
+    )
+    parser.add_argument(
+        "--max-wait-ready-seconds",
+        type=float,
+        default=18.0,
+        help="Max seconds in WAIT_READY before fallback to DECIDE (default: 18)",
     )
     parser.add_argument(
         "--click-hold-seconds",
@@ -743,6 +1166,66 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.35,
         help="Delay before post-click verification (default: 0.35)",
+    )
+    parser.add_argument(
+        "--ready-verify-after-click-seconds",
+        type=float,
+        default=0.55,
+        help="Delay before Ready post-click verification (default: 0.55)",
+    )
+    parser.add_argument(
+        "--ready-verify-min-drop",
+        type=float,
+        default=0.22,
+        help="Minimum Ready score drop to accept click as successful (default: 0.22)",
+    )
+    parser.add_argument(
+        "--continue-green-min-ratio",
+        type=float,
+        default=0.16,
+        help="Minimum green ratio for Continue button candidate (default: 0.16)",
+    )
+    parser.add_argument(
+        "--retry-blue-min-ratio",
+        type=float,
+        default=0.14,
+        help="Minimum blue ratio for Retry button candidate (default: 0.14)",
+    )
+    parser.add_argument(
+        "--button-white-text-min-ratio",
+        type=float,
+        default=0.018,
+        help="Minimum white-text ratio for stage button candidate (default: 0.018)",
+    )
+    parser.add_argument(
+        "--ready-green-min-ratio",
+        type=float,
+        default=0.12,
+        help="Minimum green ratio for Ready button candidate (default: 0.12)",
+    )
+    parser.add_argument(
+        "--stage-min-y-ratio",
+        type=float,
+        default=0.62,
+        help="Minimum Y ratio for stage button center (default: 0.62)",
+    )
+    parser.add_argument(
+        "--stage-max-y-ratio",
+        type=float,
+        default=0.94,
+        help="Maximum Y ratio for stage button center (default: 0.94)",
+    )
+    parser.add_argument(
+        "--stage-min-x-ratio",
+        type=float,
+        default=0.24,
+        help="Minimum X ratio for stage button center (default: 0.24)",
+    )
+    parser.add_argument(
+        "--stage-max-x-ratio",
+        type=float,
+        default=0.76,
+        help="Maximum X ratio for stage button center (default: 0.76)",
     )
     parser.add_argument(
         "--hover-jiggle-enabled",
@@ -776,7 +1259,17 @@ def parse_args() -> argparse.Namespace:
         "--ready-roi",
         type=str,
         default=None,
-        help="Legacy field (unused in runtime). ROI format x,y,w,h",
+        help="Ready ROI in pixels format x,y,w,h (for ready detection)",
+    )
+    parser.add_argument(
+        "--skip-ready",
+        action="store_true",
+        help="Disable Ready stage and go straight back to decision loop after loading",
+    )
+    parser.add_argument(
+        "--ready-only",
+        action="store_true",
+        help="Only detect/click Ready (full-screen by default, no decision flow)",
     )
     parser.add_argument(
         "--suggest-roi",
@@ -855,17 +1348,32 @@ def main() -> None:
     config = BotConfig(
         threshold_button=args.threshold_button,
         threshold_continue=args.threshold_continue,
+        threshold_ready=args.threshold_ready,
+        threshold_ready_text=args.threshold_ready_text,
         threshold_rewards=args.threshold_rewards,
+        max_wait_ready_seconds=max(5.0, args.max_wait_ready_seconds),
         scan_interval=args.scan_interval,
         loading_wait=args.loading_wait,
         click_hold_seconds=max(0.01, args.click_hold_seconds),
         click_retries=max(1, args.click_retries),
         verify_after_click_seconds=max(0.05, args.verify_after_click_seconds),
+        ready_verify_after_click_seconds=max(0.10, args.ready_verify_after_click_seconds),
+        ready_verify_min_drop=max(0.0, min(1.0, args.ready_verify_min_drop)),
+        continue_green_min_ratio=max(0.0, min(1.0, args.continue_green_min_ratio)),
+        retry_blue_min_ratio=max(0.0, min(1.0, args.retry_blue_min_ratio)),
+        ready_green_min_ratio=max(0.0, min(1.0, args.ready_green_min_ratio)),
+        button_white_text_min_ratio=max(0.0, min(1.0, args.button_white_text_min_ratio)),
+        stage_min_y_ratio=max(0.0, min(1.0, args.stage_min_y_ratio)),
+        stage_max_y_ratio=max(0.0, min(1.0, args.stage_max_y_ratio)),
+        stage_min_x_ratio=max(0.0, min(1.0, args.stage_min_x_ratio)),
+        stage_max_x_ratio=max(0.0, min(1.0, args.stage_max_x_ratio)),
         hover_jiggle_enabled=(not args.no_hover_jiggle) or args.hover_jiggle_enabled,
         hover_jiggle_pixels=max(1, args.hover_jiggle_pixels),
         hover_jiggle_delay=max(0.0, args.hover_jiggle_delay),
         decision_roi=decision_roi,
         ready_roi=ready_roi,
+        ready_only_mode=args.ready_only,
+        enable_ready_click=not args.skip_ready,
         enable_hotkeys=not args.no_hotkeys,
         pause_hotkey=args.pause_hotkey,
         stop_hotkey=args.stop_hotkey,
