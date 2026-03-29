@@ -154,3 +154,19 @@ python bot_retry_continue.py --pause-hotkey "<f6>" --stop-hotkey "<f7>" --debug
 ```powershell
 .\run_bot.bat --click-hold-seconds 0.10 --click-retries 4 --verify-after-click-seconds 0.45 --debug
 ```
+
+- Jika bot kadang sukses di awal lalu macet di siklus berikutnya, aktifkan timeout recovery WAIT_READY:
+
+```powershell
+.\run_bot.bat --max-wait-ready-seconds 18 --debug
+```
+
+- Jika loop pertama sukses tapi `Ready` berikutnya sering tidak terdeteksi, gunakan threshold ready adaptif:
+
+```powershell
+.\run_bot.bat --threshold-ready 0.56 --threshold-ready-relaxed 0.48 --ready-relax-after-seconds 6 --max-wait-ready-seconds 18 --debug
+```
+
+Bot sekarang akan otomatis balik ke mode DECIDE jika:
+- terlalu lama menunggu Ready
+- atau tombol Retry/Next muncul lagi saat mode tunggu Ready (indikasi klik sebelumnya gagal)

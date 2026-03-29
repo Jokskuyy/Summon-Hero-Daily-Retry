@@ -37,7 +37,10 @@ class BotConfig:
     threshold_button: float = 0.82
     threshold_continue: float = 0.60
     threshold_ready: float = 0.58
+    threshold_ready_relaxed: float = 0.50
     threshold_rewards: float = 0.84
+    max_wait_ready_seconds: float = 25.0
+    ready_relax_after_seconds: float = 8.0
     scan_interval: float = 0.35
     post_click_sleep: float = 1.6
     loading_wait: float = 8.0
@@ -187,11 +190,11 @@ class AdventureBot:
     @staticmethod
     def _default_ready_roi(screen: np.ndarray) -> ROI:
         h, w = screen.shape[:2]
-        # Ready button usually appears in lower section of the screen.
-        x = int(w * 0.12)
-        y = int(h * 0.52)
-        rw = int(w * 0.76)
-        rh = int(h * 0.44)
+        # Keep this wide; ready position can drift between stages/resolutions.
+        x = int(w * 0.08)
+        y = int(h * 0.30)
+        rw = int(w * 0.84)
+        rh = int(h * 0.65)
         return (x, y, rw, rh)
 
     def _find_best(
@@ -364,7 +367,9 @@ class AdventureBot:
         print(f"Threshold button: {self.config.threshold_button}")
         print(f"Threshold continue: {self.config.threshold_continue}")
         print(f"Threshold ready: {self.config.threshold_ready}")
+        print(f"Threshold ready relaxed: {self.config.threshold_ready_relaxed}")
         print(f"Threshold rewards: {self.config.threshold_rewards}")
+        print(f"Max wait ready: {self.config.max_wait_ready_seconds}s")
         print(f"Click retries: {self.config.click_retries}")
         print(f"Decision ROI: {self.config.decision_roi}")
         print(f"Ready ROI: {self.config.ready_roi}")
@@ -383,6 +388,7 @@ class AdventureBot:
         runtime.start()
 
         phase = "DECIDE"
+        phase_started_at = time.time()
         next_scan_at = time.time()
 
         try:
@@ -402,19 +408,20 @@ class AdventureBot:
 
                 screen = self._capture_screen()
                 matches = self._detect_state(screen)
+                decision_roi = self.config.decision_roi or self._default_decision_roi(screen)
+                ready_roi = self.config.ready_roi or self._default_ready_roi(screen)
 
                 rewards_score = self._score(matches["rewards_positive"])
                 rewards_zero_score = self._score(matches["rewards_zero"])
                 retry_score = self._score(matches["retry"])
                 continue_score = self._score(matches["continue"])
                 ready_score = self._score(matches["ready"])
+                retry_visible = retry_score >= self.config.threshold_button
+                continue_visible = continue_score >= self.config.threshold_continue
 
                 if phase == "DECIDE":
                     rewards_left_positive = rewards_score >= self.config.threshold_rewards
                     rewards_zero = rewards_zero_score >= self.config.threshold_rewards
-                    retry_visible = retry_score >= self.config.threshold_button
-                    continue_visible = continue_score >= self.config.threshold_continue
-                    decision_roi = self.config.decision_roi or self._default_decision_roi(screen)
 
                     if rewards_zero and continue_visible:
                         _, pos, size = matches["continue"]  # type: ignore[misc]
@@ -429,6 +436,7 @@ class AdventureBot:
                         )
                         if clicked:
                             phase = "WAIT_READY"
+                            phase_started_at = time.time()
                             next_scan_at = time.time() + self.config.loading_wait
                             continue
                         next_scan_at = time.time() + self.config.scan_interval
@@ -447,6 +455,7 @@ class AdventureBot:
                         )
                         if clicked:
                             phase = "WAIT_READY"
+                            phase_started_at = time.time()
                             next_scan_at = time.time() + self.config.loading_wait
                             continue
                         next_scan_at = time.time() + self.config.scan_interval
@@ -465,6 +474,7 @@ class AdventureBot:
                         )
                         if clicked:
                             phase = "WAIT_READY"
+                            phase_started_at = time.time()
                             next_scan_at = time.time() + self.config.loading_wait
                             continue
                         next_scan_at = time.time() + self.config.scan_interval
@@ -484,6 +494,7 @@ class AdventureBot:
                         )
                         if clicked:
                             phase = "WAIT_READY"
+                            phase_started_at = time.time()
                             next_scan_at = time.time() + self.config.loading_wait
                             continue
                         next_scan_at = time.time() + self.config.scan_interval
@@ -502,6 +513,7 @@ class AdventureBot:
                         )
                         if clicked:
                             phase = "WAIT_READY"
+                            phase_started_at = time.time()
                             next_scan_at = time.time() + self.config.loading_wait
                             continue
                         next_scan_at = time.time() + self.config.scan_interval
@@ -511,12 +523,46 @@ class AdventureBot:
                     continue
 
                 if phase == "WAIT_READY":
-                    if ready_score >= self.config.threshold_ready:
+                    waited = time.time() - phase_started_at
+                    effective_ready_threshold = self.config.threshold_ready
+                    if waited >= self.config.ready_relax_after_seconds:
+                        effective_ready_threshold = min(
+                            self.config.threshold_ready, self.config.threshold_ready_relaxed
+                        )
+
+                    # Recovery: if result buttons appear again, previous click likely failed.
+                    if retry_visible or continue_visible:
+                        print("[RECOVERY] Result buttons visible while waiting ready. Returning to DECIDE.")
+                        phase = "DECIDE"
+                        phase_started_at = time.time()
+                        next_scan_at = time.time() + self.config.scan_interval
+                        continue
+
+                    if waited >= self.config.max_wait_ready_seconds:
+                        print("[RECOVERY] WAIT_READY timeout reached. Returning to DECIDE.")
+                        phase = "DECIDE"
+                        phase_started_at = time.time()
+                        next_scan_at = time.time() + self.config.scan_interval
+                        continue
+
+                    if ready_score >= effective_ready_threshold:
                         _, pos, size = matches["ready"]  # type: ignore[misc]
                         cx, cy = self._center(pos, size)
-                        self._click(cx, cy, "Ready")
-                        phase = "DECIDE"
-                        next_scan_at = time.time() + self.config.post_click_sleep
+                        clicked = self._click_with_verification(
+                            cx,
+                            cy,
+                            "Ready",
+                            verify_template_key="ready",
+                            verify_threshold=max(0.20, effective_ready_threshold - 0.03),
+                            verify_roi=ready_roi,
+                        )
+                        if clicked:
+                            phase = "DECIDE"
+                            phase_started_at = time.time()
+                            next_scan_at = time.time() + self.config.post_click_sleep
+                            continue
+
+                        next_scan_at = time.time() + self.config.scan_interval
                         continue
 
                     next_scan_at = time.time() + self.config.scan_interval
@@ -650,10 +696,28 @@ def parse_args() -> argparse.Namespace:
         help="Template score threshold for Ready button (default: 0.58)",
     )
     parser.add_argument(
+        "--threshold-ready-relaxed",
+        type=float,
+        default=0.50,
+        help="Relaxed threshold for Ready after wait period (default: 0.50)",
+    )
+    parser.add_argument(
         "--threshold-rewards",
         type=float,
         default=0.84,
         help="Template score threshold for rewards text (default: 0.84)",
+    )
+    parser.add_argument(
+        "--ready-relax-after-seconds",
+        type=float,
+        default=8.0,
+        help="Seconds in WAIT_READY before using relaxed Ready threshold (default: 8)",
+    )
+    parser.add_argument(
+        "--max-wait-ready-seconds",
+        type=float,
+        default=25.0,
+        help="Max seconds in WAIT_READY before automatic recovery to DECIDE (default: 25)",
     )
     parser.add_argument(
         "--scan-interval",
@@ -775,7 +839,10 @@ def main() -> None:
         threshold_button=args.threshold_button,
         threshold_continue=args.threshold_continue,
         threshold_ready=args.threshold_ready,
+        threshold_ready_relaxed=args.threshold_ready_relaxed,
         threshold_rewards=args.threshold_rewards,
+        max_wait_ready_seconds=max(5.0, args.max_wait_ready_seconds),
+        ready_relax_after_seconds=max(1.0, args.ready_relax_after_seconds),
         scan_interval=args.scan_interval,
         loading_wait=args.loading_wait,
         click_hold_seconds=max(0.01, args.click_hold_seconds),
