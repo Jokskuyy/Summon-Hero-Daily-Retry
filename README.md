@@ -128,6 +128,30 @@ Alternatif cepat: jalankan mode `--suggest-roi` saat screen hasil stage terlihat
 - `--no-load-roi-config`: matikan auto-load ROI dari file
 - `--no-save-roi-config`: matikan auto-save hasil suggest ROI
 
+## 6.1) Opsi Monitor (Primary/Secondary)
+
+- `--monitor-index`: pilih monitor target (1-based, default `1`)
+- `--list-monitors`: tampilkan daftar monitor yang terdeteksi lalu exit
+
+Lihat daftar monitor dulu:
+
+```powershell
+.\run_bot.bat --list-monitors
+```
+
+Jalankan bot di monitor secondary (contoh monitor ke-2):
+
+```powershell
+.\run_bot.bat --monitor-index 2 --no-load-roi-config --debug
+```
+
+Disarankan pakai file ROI terpisah per monitor/resolusi:
+
+```powershell
+.\run_bot.bat --monitor-index 2 --roi-config roi_1080_secondary.json --suggest-roi --debug
+.\run_bot.bat --monitor-index 2 --roi-config roi_1080_secondary.json --debug
+```
+
 ## 7) Opsi hotkey runtime
 
 - `--no-hotkeys`: matikan hotkey global

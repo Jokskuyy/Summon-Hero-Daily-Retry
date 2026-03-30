@@ -66,6 +66,7 @@ class BotConfig:
     enable_hotkeys: bool = True
     pause_hotkey: str = "<f8>"
     stop_hotkey: str = "<f9>"
+    monitor_index: int = 1
     template_scales: Tuple[float, ...] = (0.78, 0.88, 1.0, 1.12, 1.25)
     ready_template_scales: Tuple[float, ...] = (0.92, 1.0, 1.08, 1.16)
     debug: bool = False
@@ -152,7 +153,7 @@ class AdventureBot:
         }
 
         self._validate_templates()
-        self.monitor = self._get_primary_monitor()
+        self.monitor = self._get_monitor(config.monitor_index)
 
     def _load_templates(self, pattern: str) -> List[np.ndarray]:
         files = sorted(glob.glob(str(self.images_dir / pattern)))
@@ -182,10 +183,28 @@ class AdventureBot:
             )
 
     @staticmethod
-    def _get_primary_monitor() -> Dict[str, int]:
+    def list_monitors() -> List[Dict[str, int]]:
         with mss.mss() as sct:
-            # monitor[0] is a virtual monitor (all displays). monitor[1] is primary.
-            return dict(sct.monitors[1])
+            # monitor[0] is a virtual monitor (all displays).
+            return [dict(mon) for mon in sct.monitors[1:]]
+
+    @classmethod
+    def _get_monitor(cls, monitor_index: int) -> Dict[str, int]:
+        monitors = cls.list_monitors()
+        if len(monitors) == 0:
+            raise RuntimeError("No monitor detected by mss")
+
+        if monitor_index < 1 or monitor_index > len(monitors):
+            raise ValueError(
+                f"--monitor-index {monitor_index} is out of range. "
+                f"Available monitor index: 1..{len(monitors)}"
+            )
+
+        return monitors[monitor_index - 1]
+
+    def _to_virtual_screen_coords(self, x: int, y: int) -> Point:
+        # Captured images are local to selected monitor; mouse APIs need virtual-desktop coords.
+        return (x + int(self.monitor["left"]), y + int(self.monitor["top"]))
 
     def _capture_screen(self) -> np.ndarray:
         with mss.mss() as sct:
@@ -278,21 +297,26 @@ class AdventureBot:
         return (pos[0] + size[0] // 2, pos[1] + size[1] // 2)
 
     def _click(self, x: int, y: int, reason: str) -> None:
+        screen_x, screen_y = self._to_virtual_screen_coords(x, y)
+
         if self.config.dry_run:
-            print(f"[DRY RUN] Click {reason} at ({x}, {y})")
+            print(
+                f"[DRY RUN] Click {reason} at monitor=({x}, {y}) "
+                f"virtual=({screen_x}, {screen_y})"
+            )
             return
 
-        clicker.moveTo(x, y)
+        clicker.moveTo(screen_x, screen_y)
         if self.config.hover_jiggle_enabled:
             j = max(1, self.config.hover_jiggle_pixels)
             d = max(0.0, self.config.hover_jiggle_delay)
             # Small motion around target to trigger hover-highlight states before click.
             path = [
-                (x + j, y),
-                (x - j, y),
-                (x, y - j),
-                (x, y + j),
-                (x, y),
+                (screen_x + j, screen_y),
+                (screen_x - j, screen_y),
+                (screen_x, screen_y - j),
+                (screen_x, screen_y + j),
+                (screen_x, screen_y),
             ]
             for px, py in path:
                 clicker.moveTo(px, py)
@@ -301,13 +325,16 @@ class AdventureBot:
 
         try:
             # Press and release explicitly; Roblox sometimes ignores fast click().
-            clicker.mouseDown(x=x, y=y)
+            clicker.mouseDown(x=screen_x, y=screen_y)
             time.sleep(self.config.click_hold_seconds)
-            clicker.mouseUp(x=x, y=y)
+            clicker.mouseUp(x=screen_x, y=screen_y)
         except Exception:
             # Fallback for libraries/platforms that may not expose mouseDown/mouseUp equally.
-            clicker.click(x, y)
-        print(f"[ACTION] Click {reason} at ({x}, {y}) using {CLICKER_NAME}")
+            clicker.click(screen_x, screen_y)
+        print(
+            f"[ACTION] Click {reason} at monitor=({x}, {y}) "
+            f"virtual=({screen_x}, {screen_y}) using {CLICKER_NAME}"
+        )
 
     def _score_in_roi(self, screen: np.ndarray, template_key: str, roi: Optional[ROI]) -> float:
         match = self._find_best(screen, self.templates[template_key], roi)
@@ -650,6 +677,12 @@ class AdventureBot:
         )
         print(f"Decision ROI: {self.config.decision_roi}")
         print(f"Ready ROI: {self.config.ready_roi}")
+        print(f"Monitor index: {self.config.monitor_index}")
+        print(
+            "Monitor geometry: "
+            f"left={self.monitor['left']}, top={self.monitor['top']}, "
+            f"width={self.monitor['width']}, height={self.monitor['height']}"
+        )
         print(f"Ready only mode: {self.config.ready_only_mode}")
         print(f"Enable ready click: {self.config.enable_ready_click}")
         print(f"Dry run: {self.config.dry_run}")
@@ -1132,6 +1165,17 @@ def parse_args() -> argparse.Namespace:
         help="Template score threshold for rewards text (default: 0.84)",
     )
     parser.add_argument(
+        "--monitor-index",
+        type=int,
+        default=1,
+        help="Monitor index to capture/click (1-based, default: 1)",
+    )
+    parser.add_argument(
+        "--list-monitors",
+        action="store_true",
+        help="Print available monitor indexes and geometry, then exit",
+    )
+    parser.add_argument(
         "--scan-interval",
         type=float,
         default=0.35,
@@ -1329,6 +1373,20 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
+    if args.list_monitors:
+        monitors = AdventureBot.list_monitors()
+        print("=== Available monitors ===")
+        if len(monitors) == 0:
+            print("No monitor detected")
+            return
+
+        for index, monitor in enumerate(monitors, start=1):
+            print(
+                f"[{index}] left={monitor['left']}, top={monitor['top']}, "
+                f"width={monitor['width']}, height={monitor['height']}"
+            )
+        return
+
     roi_config_path = Path(args.roi_config).resolve()
     decision_roi = _parse_roi(args.decision_roi)
     ready_roi = _parse_roi(args.ready_roi)
@@ -1377,6 +1435,7 @@ def main() -> None:
         enable_hotkeys=not args.no_hotkeys,
         pause_hotkey=args.pause_hotkey,
         stop_hotkey=args.stop_hotkey,
+        monitor_index=args.monitor_index,
         debug=args.debug,
         dry_run=args.dry_run,
     )
